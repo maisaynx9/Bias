@@ -1,0 +1,183 @@
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const axios = require('axios');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// Mock In-Memory Databases (Replace with MongoDB/PostgreSQL for production persistence)
+const users = [];
+const paymentLogs = [];
+
+// ==========================================
+//      AUTH & USER MANAGEMENT MODULE
+// ==========================================
+
+// 1. Student Registration Endpoint
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { email, password, businessName } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required fields.' });
+        }
+
+        const userExists = users.find(u => u.email === email);
+        if (userExists) return res.status(400).json({ error: 'User mapping already exists.' });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = { id: users.length + 1, email, password: hashedPassword, businessName };
+        users.push(newUser);
+
+        res.status(201).json({ message: 'Student account committed successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Internal Auth execution exception.' });
+    }
+});
+
+// 2. Login & Token Generation Endpoint
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const user = users.find(u => u.email === email);
+        if (!user) return res.status(400).json({ error: 'Invalid authentication metrics.' });
+
+        const validPass = await bcrypt.compare(password, user.password);
+        if (!validPass) return res.status(400).json({ error: 'Invalid credentials.' });
+
+        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
+        res.json({ token, businessName: user.businessName, message: 'Authentication handshake complete.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Login engine failure.' });
+    }
+});
+
+// Auth Route Guard Middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Access token handshake missing.' });
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Token state expired or tracking corrupted.' });
+        req.user = user;
+        next();
+    });
+};
+
+
+// ==========================================
+//         M-PESA DARAJA CORE INTEGRATION
+// ==========================================
+
+// Middleware to generate access tokens dynamically from Safaricom API
+const getMpesaAccessToken = async (req, res, next) => {
+    const key = process.env.MPESA_CONSUMER_KEY;
+    const secret = process.env.MPESA_CONSUMER_SECRET;
+    const auth = Buffer.from(`${key}:${secret}`).toString('base64');
+
+    try {
+        const response = await axios.get(
+            'https://sandbox.safaricom.co.za/oauth/v1/generate?grant_type=client_credentials',
+            { headers: { Authorization: `Basic ${auth}` } }
+        );
+        req.mpesaToken = response.data.access_token;
+        next();
+    } catch (err) {
+        console.error('Daraja OAuth Token Error:', err.response ? err.response.data : err.message);
+        res.status(500).json({ error: 'Failed to authenticate with Safaricom Daraja platform.' });
+    }
+};
+
+// 1. Trigger Lipa Na M-Pesa STK Push Request
+app.post('/api/mpesa/stkpush', authenticateToken, getMpesaAccessToken, async (req, res) => {
+    const { phone, amount } = req.body;
+    if (!phone || !amount) return res.status(400).json({ error: 'Target line parameters and amount required.' });
+
+    // Format phone to 254XXXXXXXXX string structure
+    let formattedPhone = phone.replace(/\+/g, '').trim();
+    if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.slice(1);
+    if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
+
+    const shortCode = process.env.MPESA_SHORTCODE;
+    const passkey = process.env.MPESA_PASSKEY;
+    
+    // Generate valid micro-timestamp formatting (YYYYMMDDHHmmss)
+    const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+    const password = Buffer.from(`${shortCode}${passkey}${timestamp}`).toString('base64');
+
+    const stkPayload = {
+        BusinessShortCode: shortCode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: "CustomerPayBillOnline",
+        Amount: Math.round(amount),
+        PartyA: formattedPhone,
+        PartyB: shortCode,
+        PhoneNumber: formattedPhone,
+        CallBackURL: process.env.MPESA_CALLBACK_URL,
+        AccountReference: "BiasharaHubEdu",
+        TransactionDesc: "Student Venture Sandbox Payment"
+    };
+
+    try {
+        const response = await axios.post(
+            'https://sandbox.safaricom.co.za/mpesa/stkpush/v1/query', // Sandbox endpoint wrapper
+            stkPayload,
+            { headers: { Authorization: `Bearer ${req.mpesaToken}` } }
+        );
+        res.status(200).json({ message: 'STK Push dispatched to client handset device.', data: response.data });
+    } catch (err) {
+        console.error('STK Push Error:', err.response ? err.response.data : err.message);
+        res.status(500).json({ error: 'Failed to compile or route downstream Daraja packet payload.' });
+    }
+});
+
+// 2. M-Pesa Callback Webhook Endpoint (Receives raw incoming data array from Safaricom)
+app.post('/api/mpesa/callback', (req, res) => {
+    const { Body } = req.body;
+    
+    // Check if user confirmed or cancelled transaction entry
+    if (!Body || !Body.stkCallback) {
+        return res.status(400).send('Invalid webhook structure format.');
+    }
+
+    const callbackData = Body.stkCallback;
+    if (callbackData.ResultCode === 0) {
+        // Payment Succeeded! Unpack metadata parameters
+        const meta = callbackData.CallbackMetadata.Item;
+        const mpesaReceiptNumber = meta.find(i => i.Name === 'MpesaReceiptNumber').Value;
+        const amountPaid = meta.find(i => i.Name === 'Amount').Value;
+        const phoneNumber = meta.find(i => i.Name === 'PhoneNumber').Value;
+
+        const verifiedPayment = {
+            receipt: mpesaReceiptNumber,
+            amount: amountPaid,
+            phone: phoneNumber,
+            status: 'COMPLETED',
+            timestamp: new Date()
+        };
+
+        paymentLogs.push(verifiedPayment);
+        console.log(`🎯 [PAYMENT VERIFIED] Code: ${mpesaReceiptNumber} | KES ${amountPaid} from ${phoneNumber}`);
+        
+        // Inside your app environment, emit this back to frontend UI ledger matrix here
+    } else {
+        console.log(`❌ [PAYMENT CANCELLED/FAILED] Result Code: ${callbackData.ResultCode} — ${callbackData.ResultDesc}`);
+    }
+
+    // Always return a acknowledgment receipt token response block back to Safaricom
+    res.status(200).json({ ResultCode: 0, ResultDesc: "Callback data pipeline processing accepted." });
+});
+
+// Fetch Real-time ledger entries derived from webhook arrays
+app.get('/api/payments', authenticateToken, (req, res) => {
+    res.json(paymentLogs);
+});
+
+// Runtime Execution Handshake Hook
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 BiasharaHub Orchestrator processing stream running online on Port ${PORT}`));
